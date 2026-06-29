@@ -1,0 +1,7 @@
+#Ignore compiled C++ binaries
+cmd/server/server
+*.o
+*.out
+
+#Ignore Environment variables / Secrets
+.env
