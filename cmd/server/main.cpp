@@ -38,6 +38,14 @@ void initialize_database(){
 				"created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
 				");"
 			);
+			tx.exec("CREATE TABLE IF NOT EXISTS files("
+					"id SERIAL PRIMARY KEY, "
+					"user_id INTEGER REFERENCES users(id), "
+					"filename VARCHAR(255) NOT NULL, "
+					"minio_key VARCHAR(255) NOT NULL, "
+					"created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+					");"
+			       );
 			tx.commit();
 			std::cout << "[Database] Users table verified.\n";
 	}
@@ -98,24 +106,32 @@ void handle_client(int client_fd) {
 		   size_t body_pos = request.find("\r\n\r\n");
 		   if(body_pos != std::string::npos) {
 			   std::string file_content = request.substr(body_pos + 4);
+                           
+                           std::string minio_key = "FILE_CREATED_AT_"+std::to_string(time(nullptr))+".bin";
 
 			   MinioClient storage("http://localhost:9000", "minioadmin", "minioadmin", "obscura-api");
   
-			   std::string response;
-			   if(storage.upload_file("user_upload.bin", file_content)){
-				   response = "HTTP/1.1 200 OK\r\n"
-					                  "Content-length: 15\r\n"
-							  "\r\n"
-							  "Upload Success";
+			   if(storage.upload_file(minio_key, file_content)) {
+				   try {
+					   const char* db_pass = std::getenv("DB_PASSWORD");
+					   pqxx::connection conn{"host=127.0.0.1 port=5432 user=vault_admin password=" + std::string(db_pass) + " dbname=obscura_vault"};
+					   pqxx::work tx{conn};
 
+					  tx.exec( "INSERT INTO files (user_id, filename, minio_key) VALUES ($1, $2, $3)", 
+                                                   pqxx::params{1, "uploaded_file.bin", minio_key}
+);
+					   tx.commit();
+
+					   std::string response = "HTTP/1.1 200 OK\r\n"
+						   "Content-Length: 14\r\n"
+						   "\r\n"
+						   "Upload Success";
+					   send(client_fd, response.c_str(), response.length(), 0);
+				   }
+				   catch(const std::exception& e) {
+					   std::cerr << "[DB Error] " << e.what() << std::endl;
+				   }
 			   }
-			   else {
-				response = "HTTP/1.1 500 Internal Server Error\r\n"
-                                           "Content-Length: 13\r\n"
-                                           "\r\n"
-                                           "Upload Failed";
-			   }
-			   send(client_fd, response.c_str(), response.length(), 0);
 		   }
 	   }
 
