@@ -106,19 +106,23 @@ void handle_client(int client_fd) {
 		   size_t body_pos = request.find("\r\n\r\n");
 		   if(body_pos != std::string::npos) {
 			   std::string file_content = request.substr(body_pos + 4);
-                           
+                           json req = json::parse(file_content);
+			   std::string original_filename = req["filename"];
+			   std::string data = req["content"];
+
+
                            std::string minio_key = "FILE_CREATED_AT_"+std::to_string(time(nullptr))+".bin";
 
 			   MinioClient storage("http://localhost:9000", "minioadmin", "minioadmin", "obscura-api");
   
-			   if(storage.upload_file(minio_key, file_content)) {
+			   if(storage.upload_file(minio_key, data)) {
 				   try {
 					   const char* db_pass = std::getenv("DB_PASSWORD");
 					   pqxx::connection conn{"host=127.0.0.1 port=5432 user=vault_admin password=" + std::string(db_pass) + " dbname=obscura_vault"};
 					   pqxx::work tx{conn};
 
 					  tx.exec( "INSERT INTO files (user_id, filename, minio_key) VALUES ($1, $2, $3)", 
-                                                   pqxx::params{1, "uploaded_file.bin", minio_key}
+                                                   pqxx::params{1, original_filename, minio_key}
 );
 					   tx.commit();
 
@@ -135,6 +139,123 @@ void handle_client(int client_fd) {
 		   }
 	   }
 
+		else if(request.find("POST /login") != std::string::npos) {
+			size_t body_pos = request.find("\r\n\r\n");
+			if(body_pos != std::string::npos)
+			{
+				std::string body = request.substr(body_pos + 4);
+			
+
+			try {
+				json json_body = json::parse(body);
+				std::string user = json_body["username"];
+				std::string pass = json_body["password"];
+
+				const char* db_pass = std::getenv("DB_PASSWORD");
+				std::string conn_str = "host=127.0.0.1 port=5432 user=vault_admin password="+std::string(db_pass)+" dbname=obscura_vault";
+				pqxx::connection conn{conn_str};
+				pqxx::work tx{conn};
+
+				pqxx::result res = tx.exec(
+						"SELECT id FROM users WHERE username = $1 AND password_hash = $2",
+						pqxx::params{user, pass}
+						);
+				tx.commit();
+
+				if(!res.empty()) {
+					int user_id = res[0][0].as<int>();
+					std::cout << "[Server] User " + user + " logged in successfullly with ID: " << user_id << "\n";
+
+					json response_json;
+					response_json["status"] = "success";
+					response_json["user_id"] = user_id;
+					std::string response_body = response_json.dump();
+
+					std::string response = "HTTP/1.1 200 OK\r\n"
+						"Content-Type: application/json\r\n"
+						"Content-Length: " + std::to_string(response_body.length()) + "\r\n"
+						"\r\n" + response_body;
+
+					send(client_fd, response.c_str(), response.length(), 0);
+				}
+				else {
+					std::cout << "[Server] User " +user+ " is not Registered\n";
+					std::string err_response = "HTTP/1.1 401 Unauthorized\r\n"
+						"Content-Type: application/json\r\n"
+						"Content-Length: 19\r\n"
+						"\r\n"
+						"Invalid credentials";
+					send(client_fd, err_response.c_str(), err_response.length(), 0);
+				}
+			}
+			catch(const std::exception& e) {
+				std::cerr << "[LOGIN ERROR!] " << e.what() << "\n";
+				std::string err_response = "HTTP/1.1 400 Bad Request\r\n";
+					send(client_fd, err_response.c_str(), err_response.length(), 0);
+			}
+			}
+		}
+		else if(request.find("GET /download/") != std::string::npos) {
+			try {
+				size_t start_pos = request.find("GET /download/") + 14;
+				size_t end_pos = request.find(" HTTP/");
+				std::string file_id_str = request.substr(start_pos, end_pos - start_pos);
+				int file_id = stoi(file_id_str);
+
+				const char* db_pass = std::getenv("DB_PASSWORD");
+				std::string conn_str = "host=127.0.0.1 port=5432 user=vault_admin password=" + std::string(db_pass) + " dbname=obscura_vault";
+				pqxx::connection conn{conn_str};
+				pqxx::work tx{conn};
+
+				pqxx::result res = tx.exec(
+						"SELECT filename, minio_key FROM files WHERE id = $1",
+						pqxx::params{file_id}
+						);
+				tx.commit();
+
+				if(!res.empty())
+				{
+					std::string filename = res[0][0].as<std::string>();
+					std::string minio_key = res[0][1].as<std::string>();
+					std::cout << "[Server] Downloading file: " << filename << " with Key: " + minio_key << "\n";
+
+					MinioClient storage("http://localhost:9000", "minioadmin", "minioadmin", "obscura-api");
+					std::string file_data = storage.download_file(minio_key);
+
+					if(!file_data.empty()) {
+						std::string header = "HTTP/1.1 200 OK\r\n"
+							"Content-Type: application/octet-stream\r\n"
+							"Content-Disposition: attachment; filename=\"" + filename + "\"\r\n"
+							"Content-Length: " + std::to_string(file_data.length()) + "\r\n"
+							"\r\n";
+
+						send(client_fd, header.c_str(), header.length(), 0);
+						send(client_fd, file_data.c_str(), file_data.length(), 0);
+
+						std::cout << "[Server] Successfully send " << file_data.length() << " bytes.\n";
+					}
+					else {
+						std::string err = "HTTP/1.1 500 Internal server error\r\n"
+							"\r\n"
+							"Failed to fetch the file from MinIO";
+						send(client_fd, err.c_str(), err.length(), 0);
+					}
+
+				}
+				else {
+					std::string err = "HTTP/1.1 403 Not Found\r\n"
+						"\r\n"
+						"File not found in database";
+					send(client_fd, err.c_str(), err.length(), 0);
+				}
+			}
+			catch(const std::exception& e) {
+				std::cerr << "[Download Error] " << e.what() << "\n";
+				std::string err = "HTTP/1.1 400 Bad Request\r\n\r\n";
+				send(client_fd, err.c_str(), err.length(), 0);
+			}
+		}
+
 	   else if(request.find("GET /") != std::string::npos) {
 	   std::string response = "HTTP/1.1 200 OK\r\n"
 	                          "Content-Length: 22\r\n"
@@ -144,7 +265,14 @@ void handle_client(int client_fd) {
             // Send response back
             send(client_fd, response.c_str(), response.length(), 0);
 	   }
+
+		else {
+			std::string response = "HTTP/1.1 404 Not Found\r\n"
+				               "\r\n"
+					       "The Request cannot be identified";
+			send(client_fd, response.c_str(), response.length(), 0);
 		}
+	}
 
             // Close connection
             close(client_fd);
