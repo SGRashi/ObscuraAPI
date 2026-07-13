@@ -1,4 +1,5 @@
 #include <iostream>
+#include "../../internal/encryption/crypto_utils.hpp"
 #include <string>
 #include <cstring>
 #include <atomic>
@@ -6,25 +7,23 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <pqxx/pqxx> // PostgreSQL C++ connector
+#include <pqxx/pqxx> 
 #include <nlohmann/json.hpp>
+#include <jwt-cpp/jwt.h>
+#include "config.hpp"
 #include "../../internal/storage/minio_client.hpp"
 using json = nlohmann::json;
 
-// Maximum concurrent connections allowed
 const int MAX_CONNECTIONS = 10;
 std::atomic<int> active_conn{0};
+Config cfg;
 
 void initialize_database(){
 	try{
-		const char* db_pass = std::getenv("DB_PASSWORD");
-		if(db_pass == nullptr) {
-			std::cout << "DB_PASSWORD env variable is not set\n";
-			exit(1);
-		}
+		
 		pqxx::connection conn{
 				"host=127.0.0.1 port=5432 user=vault_admin "
-				"password=" + std::string(db_pass) + " dbname=obscura_vault"};
+				"password=" + cfg.db_pass + " dbname=obscura_vault"};
 
 		if(conn.is_open()) {
 			std::cout << "[Database] Successfully connected to PostgreSQL container\n";
@@ -71,15 +70,16 @@ void handle_client(int client_fd) {
 		try {
 		   json req_json = json::parse(body);
 		   std::string user = req_json["username"];
-		   std::string pass = req_json["password"]; // this is what is needed to be hashed
-		   const char* dp_pass = std::getenv("DB_PASSWORD");
-		   std::string conn_str = "host=127.0.0.1 port=5432 user=vault_admin password="+std::string(dp_pass)+" dbname=obscura_vault";
+		   std::string pass = req_json["password"];
+		   std::string hashed_password = Crypto::hash_password(pass);
+
+		   std::string conn_str = "host=127.0.0.1 port=5432 user=vault_admin password="+cfg.db_pass+" dbname=obscura_vault";
 		   pqxx::connection conn{conn_str};
 
 		   pqxx::work tx{conn};
 		   tx.exec(
 				   "INSERT INTO users (username, password_hash) VALUES ($1, $2)",
-				  pqxx::params{user, pass}
+				  pqxx::params{user, hashed_password}
 				 );
 		   tx.commit();
 
@@ -113,12 +113,11 @@ void handle_client(int client_fd) {
 
                            std::string minio_key = "FILE_CREATED_AT_"+std::to_string(time(nullptr))+".bin";
 
-			   MinioClient storage("http://localhost:9000", "minioadmin", "minioadmin", "obscura-api");
+			   MinioClient storage("http://localhost:9000", cfg.minio_ak, cfg.minio_sk, "obscura-api");
   
 			   if(storage.upload_file(minio_key, data)) {
 				   try {
-					   const char* db_pass = std::getenv("DB_PASSWORD");
-					   pqxx::connection conn{"host=127.0.0.1 port=5432 user=vault_admin password=" + std::string(db_pass) + " dbname=obscura_vault"};
+					   pqxx::connection conn{"host=127.0.0.1 port=5432 user=vault_admin password=" + cfg.db_pass + " dbname=obscura_vault"};
 					   pqxx::work tx{conn};
 
 					  tx.exec( "INSERT INTO files (user_id, filename, minio_key) VALUES ($1, $2, $3)", 
@@ -151,24 +150,38 @@ void handle_client(int client_fd) {
 				std::string user = json_body["username"];
 				std::string pass = json_body["password"];
 
-				const char* db_pass = std::getenv("DB_PASSWORD");
-				std::string conn_str = "host=127.0.0.1 port=5432 user=vault_admin password="+std::string(db_pass)+" dbname=obscura_vault";
+				std::string conn_str = "host=127.0.0.1 port=5432 user=vault_admin password="+cfg.db_pass+" dbname=obscura_vault";
 				pqxx::connection conn{conn_str};
 				pqxx::work tx{conn};
 
 				pqxx::result res = tx.exec(
-						"SELECT id FROM users WHERE username = $1 AND password_hash = $2",
-						pqxx::params{user, pass}
+						"SELECT id, password_hash FROM users WHERE username = $1",
+						pqxx::params{user}
 						);
 				tx.commit();
 
 				if(!res.empty()) {
 					int user_id = res[0][0].as<int>();
+					std::string stored_hash = res[0][1].as<std::string>();
+
+					if(Crypto::verify_password(stored_hash, pass)) {
+
 					std::cout << "[Server] User " + user + " logged in successfullly with ID: " << user_id << "\n";
+                    
+					//Generating the JWT
+					auto token = jwt::create()
+					  .set_issuer("obscura-api")
+					  .set_type("JWS")
+					  .set_payload_claim("user_id", jwt::claim(std::to_string(user_id)))
+					  .set_issued_at(std::chrono::system_clock::now())
+					  .set_expires_at(std::chrono::system_clock::now() + std::chrono::hours{24})
+					  .sign(jwt::algorithm::hs256{cfg.jwt_secret});
+                    //End of token generation
 
 					json response_json;
 					response_json["status"] = "success";
 					response_json["user_id"] = user_id;
+					response_json["token"] = token;
 					std::string response_body = response_json.dump();
 
 					std::string response = "HTTP/1.1 200 OK\r\n"
@@ -177,7 +190,18 @@ void handle_client(int client_fd) {
 						"\r\n" + response_body;
 
 					send(client_fd, response.c_str(), response.length(), 0);
+					
 				}
+					else {
+						std::cout << "[Server] Invalid password attempt for: " << user << "\n";
+						std::string response = "HTTP/1.1 401 Unauthorized\r\n"
+							               "Content-Type: application/json\r\n"
+								       "Content-Length: 16\r\n"
+								       "\r\n"
+								       "Invalid password";
+						send(client_fd, response.c_str(), response.length(), 0);
+					}
+	}
 				else {
 					std::cout << "[Server] User " +user+ " is not Registered\n";
 					std::string err_response = "HTTP/1.1 401 Unauthorized\r\n"
@@ -202,8 +226,7 @@ void handle_client(int client_fd) {
 				std::string file_id_str = request.substr(start_pos, end_pos - start_pos);
 				int file_id = stoi(file_id_str);
 
-				const char* db_pass = std::getenv("DB_PASSWORD");
-				std::string conn_str = "host=127.0.0.1 port=5432 user=vault_admin password=" + std::string(db_pass) + " dbname=obscura_vault";
+				std::string conn_str = "host=127.0.0.1 port=5432 user=vault_admin password=" + cfg.db_pass + " dbname=obscura_vault";
 				pqxx::connection conn{conn_str};
 				pqxx::work tx{conn};
 
@@ -219,7 +242,7 @@ void handle_client(int client_fd) {
 					std::string minio_key = res[0][1].as<std::string>();
 					std::cout << "[Server] Downloading file: " << filename << " with Key: " + minio_key << "\n";
 
-					MinioClient storage("http://localhost:9000", "minioadmin", "minioadmin", "obscura-api");
+					MinioClient storage("http://localhost:9000", cfg.minio_ak, cfg.minio_sk, "obscura-api");
 					std::string file_data = storage.download_file(minio_key);
 
 					if(!file_data.empty()) {
@@ -291,25 +314,21 @@ int main() {
         return 1;
     }
 
-    // Set socket options to reuse the port instantly on restart
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // 2. Set up address structures
     struct sockaddr_in address;
     std::memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(8080);
 
-    // 3. Bind the socket
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
         std::cerr << "Bind Failed\n";
         close(server_fd);
         return 1;
     }
 
-    // 4. Listen for connections (backlog of 10)
     if (listen(server_fd, 10) < 0) {
         std::cerr << "Listen Failed\n";
         close(server_fd);
@@ -318,19 +337,16 @@ int main() {
 
     std::cout << "Listening on port 8080...\n";
 
-    // 5. Connection acceptance loop
     while (true) {
         struct sockaddr_in client_address;
         socklen_t client_len = sizeof(client_address);
         
-        // Block and wait for a new connection
         int client_fd = accept(server_fd, (struct sockaddr*)&client_address, &client_len);
         if (client_fd < 0) {
             std::cerr << "Accept connection Failed\n";
             continue;
         }
 
-        // Connection Limit Guard
         if (active_conn >= MAX_CONNECTIONS) {
             std::cerr << "[Warning] Too many connections. Rejecting client.\n";
             std::string overload_resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
@@ -342,10 +358,6 @@ int main() {
         active_conn++;
         std::cout << "[Server] Connections: " << active_conn.load() << "/10\n";
 
-        // CONCURRENCY WITHOUT EXTERNAL FUNCTIONS:
-        // We pass an anonymous lambda block directly into std::thread.
-        // [client_fd] is captured by value so every thread gets its own socket copy.
-        // [&active_conn] is captured by reference so we can safely decrement it when finished.
         std::thread(handle_client, client_fd).detach();
     }
             

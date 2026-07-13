@@ -5,3 +5,7 @@ cmd/server/server
 
 #Ignore Environment variables / Secrets
 .env
+
+#Ignore local startup and environment scripts
+cmd/server/run.sh
+
