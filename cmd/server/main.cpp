@@ -1,5 +1,4 @@
 #include <iostream>
-#include "../../internal/encryption/crypto_utils.hpp"
 #include <string>
 #include <cstring>
 #include <atomic>
@@ -7,61 +6,31 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <pqxx/pqxx> 
 #include <nlohmann/json.hpp>
 #include <jwt-cpp/jwt.h>
 #include "config.hpp"
 #include "../../internal/storage/minio_client.hpp"
+#include "../../internal/encryption/crypto_utils.hpp"
+#include "../../internal/database/db.hpp"
 using json = nlohmann::json;
 
 const int MAX_CONNECTIONS = 10;
 std::atomic<int> active_conn{0};
 Config cfg;
-
-void initialize_database(){
-	try{
-		
-		pqxx::connection conn{
-				"host=127.0.0.1 port=5432 user=vault_admin "
-				"password=" + cfg.db_pass + " dbname=obscura_vault"};
-
-		if(conn.is_open()) {
-			std::cout << "[Database] Successfully connected to PostgreSQL container\n";
-		}
-
-			pqxx::work tx(conn);
-			tx.exec("CREATE TABLE IF NOT EXISTS users("
-				"id SERIAL PRIMARY KEY, "
-				"username VARCHAR(50) UNIQUE NOT NULL, "
-				"password_hash VARCHAR(255) NOT NULL, "
-				"created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-				");"
-			);
-			tx.exec("CREATE TABLE IF NOT EXISTS files("
-					"id SERIAL PRIMARY KEY, "
-					"user_id INTEGER REFERENCES users(id), "
-					"filename VARCHAR(255) NOT NULL, "
-					"minio_key VARCHAR(255) NOT NULL, "
-					"created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-					");"
-			       );
-			tx.commit();
-			std::cout << "[Database] Users table verified.\n";
-	}
-	catch (const std::exception &e) {
-		std::cerr << "[Database Error]" << e.what() << "\n";
-		exit(1);
-	}
-}
+Database::DBManager db;
 
 void handle_client(int client_fd) {
 	char buffer[1024] = {0};
             
-            // Read incoming HTTP request
-            int bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
-            if (bytes_read > 0) {
-                std::string request(buffer);
+    // Read incoming HTTP request
+	 int bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
+     if (bytes_read > 0) {
+     std::string request(buffer);
 
+
+	 //<=================>
+	 //REGISTER ROUTE
+	 //<=================>
 		if(request.find("POST /register") != std::string::npos) {
 		size_t body_pos = request.find("\r\n\r\n");
 		if(body_pos != std::string::npos) {
@@ -73,35 +42,33 @@ void handle_client(int client_fd) {
 		   std::string pass = req_json["password"];
 		   std::string hashed_password = Crypto::hash_password(pass);
 
-		   std::string conn_str = "host=127.0.0.1 port=5432 user=vault_admin password="+cfg.db_pass+" dbname=obscura_vault";
-		   pqxx::connection conn{conn_str};
+		   //Creating user
+		   if(db.create_user(user, hashed_password)) {
+		   std::cout << "[Server] Registration Recieved Data: " << body << "\n";                
+		   std::string response = "HTTP/1.1 200 OK\r\n"
+		                      "Content-Length: 28\r\n"
+				              "\r\n"
+				              "User Registered Successfully";
 
-		   pqxx::work tx{conn};
-		   tx.exec(
-				   "INSERT INTO users (username, password_hash) VALUES ($1, $2)",
-				  pqxx::params{user, hashed_password}
-				 );
-		   tx.commit();
-
-		std::cout << "[Server] Registration Recieved Data: " << body << "\n";                
-		std::string response = "HTTP/1.1 200 OK\r\n"
-		                      "Content-Length: 10\r\n"
-				      "\r\n"
-				      "Registered";
-
-		send(client_fd, response.c_str(), response.length(), 0);
+		   send(client_fd, response.c_str(), response.length(), 0);
+		   }
+		   else {
+			throw std::runtime_error("Username already exists or SQL failure");
+		   }
 		}
 		catch (const std::exception& e) {
 			std::cerr << "[Registration Error] " << e.what() << "\n";
 			std::string err_response = "HTTP/1.1 400 Bad Request\r\n"
-				                  "Content-Length: 15\r\n"
-						  "\r\n"
-						  "Request Failed\n";
+				                       "Content-Length: 15\r\n"
+						               "\r\n"
+						               "Request Failed\n";
 			send(client_fd, err_response.c_str(), err_response.length(), 0);
 		}
-            }
-	}
-
+    }
+}
+    //<=================>
+	//UPLOAD ROUTE
+	//<=================>
 	   else if(request.find("POST /upload") != std::string::npos) {
 		   size_t body_pos = request.find("\r\n\r\n");
 		   if(body_pos != std::string::npos) {
@@ -111,59 +78,56 @@ void handle_client(int client_fd) {
 			   std::string data = req["content"];
 
 
-                           std::string minio_key = "FILE_CREATED_AT_"+std::to_string(time(nullptr))+".bin";
+               std::string minio_key = "FILE_CREATED_AT_"+std::to_string(time(nullptr))+".bin";
 
 			   MinioClient storage("http://localhost:9000", cfg.minio_ak, cfg.minio_sk, "obscura-api");
   
 			   if(storage.upload_file(minio_key, data)) {
-				   try {
-					   pqxx::connection conn{"host=127.0.0.1 port=5432 user=vault_admin password=" + cfg.db_pass + " dbname=obscura_vault"};
-					   pqxx::work tx{conn};
-
-					  tx.exec( "INSERT INTO files (user_id, filename, minio_key) VALUES ($1, $2, $3)", 
-                                                   pqxx::params{1, original_filename, minio_key}
-);
-					   tx.commit();
-
-					   std::string response = "HTTP/1.1 200 OK\r\n"
-						   "Content-Length: 14\r\n"
-						   "\r\n"
-						   "Upload Success";
-					   send(client_fd, response.c_str(), response.length(), 0);
+				   if(db.file_upload(1, original_filename, minio_key)) {
+					    std::string response = "HTTP/1.1 200 OK\r\n"
+                                               "Content-Length: 14\r\n"
+                                               "\r\n"
+                                               "Upload Success";
+						send(client_fd, response.c_str(), response.length(), 0);
 				   }
-				   catch(const std::exception& e) {
-					   std::cerr << "[DB Error] " << e.what() << std::endl;
+				   else {
+					    std::cerr << "[Critical Error] MinIO upload succeeded but DB metadata tracking failed!\n";
+                        
+                        std::string err_body = "{\"status\":\"error\",\"message\":\"Database tracking failed\"}";
+                        std::string response = "HTTP/1.1 500 Internal Server Error\r\n"
+                                               "Content-Type: application/json\r\n"
+                                               "Content-Length: " + std::to_string(err_body.length()) + "\r\n"
+                                               "\r\n" + err_body;
+                        send(client_fd, response.c_str(), response.length(), 0);
 				   }
+			   }
+			   else {
+				    std::string err_body = "{\"status\":\"error\",\"message\":\"Storage server rejected upload\"}";
+                    std::string response = "HTTP/1.1 502 Bad Gateway\r\n"
+                                           "Content-Type: application/json\r\n"
+                                           "Content-Length: " + std::to_string(err_body.length()) + "\r\n"
+                                           "\r\n" + err_body;
+                    send(client_fd, response.c_str(), response.length(), 0);
 			   }
 		   }
 	   }
-
+        //<==================>
+		// LOGIN ROUTE 
+		//<==================>
 		else if(request.find("POST /login") != std::string::npos) {
 			size_t body_pos = request.find("\r\n\r\n");
-			if(body_pos != std::string::npos)
-			{
+			if(body_pos != std::string::npos) {
 				std::string body = request.substr(body_pos + 4);
-			
-
+		
 			try {
 				json json_body = json::parse(body);
 				std::string user = json_body["username"];
 				std::string pass = json_body["password"];
 
-				std::string conn_str = "host=127.0.0.1 port=5432 user=vault_admin password="+cfg.db_pass+" dbname=obscura_vault";
-				pqxx::connection conn{conn_str};
-				pqxx::work tx{conn};
+				std::string stored_hash;
+				int user_id = 0;
 
-				pqxx::result res = tx.exec(
-						"SELECT id, password_hash FROM users WHERE username = $1",
-						pqxx::params{user}
-						);
-				tx.commit();
-
-				if(!res.empty()) {
-					int user_id = res[0][0].as<int>();
-					std::string stored_hash = res[0][1].as<std::string>();
-
+				if(db.get_user_auth(user, stored_hash, user_id)) {
 					if(Crypto::verify_password(stored_hash, pass)) {
 
 					std::cout << "[Server] User " + user + " logged in successfullly with ID: " << user_id << "\n";
@@ -190,9 +154,8 @@ void handle_client(int client_fd) {
 						"\r\n" + response_body;
 
 					send(client_fd, response.c_str(), response.length(), 0);
-					
-				}
-					else {
+					}
+				else {
 						std::cout << "[Server] Invalid password attempt for: " << user << "\n";
 						std::string response = "HTTP/1.1 401 Unauthorized\r\n"
 							               "Content-Type: application/json\r\n"
@@ -200,8 +163,8 @@ void handle_client(int client_fd) {
 								       "\r\n"
 								       "Invalid password";
 						send(client_fd, response.c_str(), response.length(), 0);
-					}
-	}
+	                }
+				}
 				else {
 					std::cout << "[Server] User " +user+ " is not Registered\n";
 					std::string err_response = "HTTP/1.1 401 Unauthorized\r\n"
@@ -217,8 +180,12 @@ void handle_client(int client_fd) {
 				std::string err_response = "HTTP/1.1 400 Bad Request\r\n";
 					send(client_fd, err_response.c_str(), err_response.length(), 0);
 			}
-			}
 		}
+	}
+
+	    //<=================>
+		//DOWNLOAD ROUTE
+		//<=================>
 		else if(request.find("GET /download/") != std::string::npos) {
 			try {
 				size_t start_pos = request.find("GET /download/") + 14;
@@ -226,20 +193,10 @@ void handle_client(int client_fd) {
 				std::string file_id_str = request.substr(start_pos, end_pos - start_pos);
 				int file_id = stoi(file_id_str);
 
-				std::string conn_str = "host=127.0.0.1 port=5432 user=vault_admin password=" + cfg.db_pass + " dbname=obscura_vault";
-				pqxx::connection conn{conn_str};
-				pqxx::work tx{conn};
+				std::string filename;
+				std::string minio_key;
 
-				pqxx::result res = tx.exec(
-						"SELECT filename, minio_key FROM files WHERE id = $1",
-						pqxx::params{file_id}
-						);
-				tx.commit();
-
-				if(!res.empty())
-				{
-					std::string filename = res[0][0].as<std::string>();
-					std::string minio_key = res[0][1].as<std::string>();
+				if(db.get_file_metadata(file_id, 1, filename, minio_key)) {
 					std::cout << "[Server] Downloading file: " << filename << " with Key: " + minio_key << "\n";
 
 					MinioClient storage("http://localhost:9000", cfg.minio_ak, cfg.minio_sk, "obscura-api");
@@ -247,10 +204,10 @@ void handle_client(int client_fd) {
 
 					if(!file_data.empty()) {
 						std::string header = "HTTP/1.1 200 OK\r\n"
-							"Content-Type: application/octet-stream\r\n"
-							"Content-Disposition: attachment; filename=\"" + filename + "\"\r\n"
-							"Content-Length: " + std::to_string(file_data.length()) + "\r\n"
-							"\r\n";
+							                 "Content-Type: application/octet-stream\r\n"
+							                 "Content-Disposition: attachment; filename=\"" + filename + "\"\r\n"
+							                 "Content-Length: " + std::to_string(file_data.length()) + "\r\n"
+							                 "\r\n";
 
 						send(client_fd, header.c_str(), header.length(), 0);
 						send(client_fd, file_data.c_str(), file_data.length(), 0);
@@ -263,12 +220,11 @@ void handle_client(int client_fd) {
 							"Failed to fetch the file from MinIO";
 						send(client_fd, err.c_str(), err.length(), 0);
 					}
-
 				}
 				else {
 					std::string err = "HTTP/1.1 403 Not Found\r\n"
-						"\r\n"
-						"File not found in database";
+						              "\r\n"
+						              "File not found in database";
 					send(client_fd, err.c_str(), err.length(), 0);
 				}
 			}
@@ -278,7 +234,9 @@ void handle_client(int client_fd) {
 				send(client_fd, err.c_str(), err.length(), 0);
 			}
 		}
-
+        //<====================>
+		//DEFAULT FALLBACK
+		//<====================>
 	   else if(request.find("GET /") != std::string::npos) {
 	   std::string response = "HTTP/1.1 200 OK\r\n"
 	                          "Content-Length: 22\r\n"
@@ -305,8 +263,7 @@ void handle_client(int client_fd) {
 }
 
 int main() {
-
-	initialize_database();
+	db.init(cfg);
     // 1. Create socket (IPv4, TCP)
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
