@@ -12,6 +12,7 @@
 #include "../../internal/storage/minio_client.hpp"
 #include "../../internal/encryption/crypto_utils.hpp"
 #include "../../internal/database/db.hpp"
+#include "../../internal/auth/jwt_utils.hpp"
 using json = nlohmann::json;
 
 const int MAX_CONNECTIONS = 10;
@@ -70,6 +71,19 @@ void handle_client(int client_fd) {
 	//UPLOAD ROUTE
 	//<=================>
 	   else if(request.find("POST /upload") != std::string::npos) {
+
+		int user_id = Auth::get_auth(request, cfg.jwt_secret);
+		if(user_id == -1) {
+			std::string response = "HTTP/1.1 401 Unauthorized\r\n"
+			                       "Content-Length: 26\r\n"
+								   "\r\n"
+								   "Missing or Invalid Session";
+			send(client_fd, response.c_str(), response.length(), 0);
+			close(client_fd);
+			active_conn--;
+			return;
+		}
+
 		   size_t body_pos = request.find("\r\n\r\n");
 		   if(body_pos != std::string::npos) {
 			   std::string file_content = request.substr(body_pos + 4);
@@ -132,15 +146,16 @@ void handle_client(int client_fd) {
 
 					std::cout << "[Server] User " + user + " logged in successfullly with ID: " << user_id << "\n";
                     
-					//Generating the JWT
+					//<=============== Generating the JWT ================>
 					auto token = jwt::create()
 					  .set_issuer("obscura-api")
+					  .set_algorithm("HS256")
 					  .set_type("JWS")
 					  .set_payload_claim("user_id", jwt::claim(std::to_string(user_id)))
 					  .set_issued_at(std::chrono::system_clock::now())
 					  .set_expires_at(std::chrono::system_clock::now() + std::chrono::hours{24})
 					  .sign(jwt::algorithm::hs256{cfg.jwt_secret});
-                    //End of token generation
+                    //<=========== End of token generation ============>
 
 					json response_json;
 					response_json["status"] = "success";
@@ -183,10 +198,23 @@ void handle_client(int client_fd) {
 		}
 	}
 
-	    //<=================>
+	    //<==================>
 		//DOWNLOAD ROUTE
-		//<=================>
+		//<==================>
 		else if(request.find("GET /download/") != std::string::npos) {
+
+			int user_id = Auth::get_auth(request, cfg.jwt_secret);
+		    if(user_id == -1) {
+			std::string response = "HTTP/1.1 401 Unauthorized\r\n"
+			                       "Content-Length: 26\r\n"
+								   "\r\n"
+								   "Missing or Invalid Session";
+			send(client_fd, response.c_str(), response.length(), 0);
+			close(client_fd);
+			active_conn--;
+			return;
+		}
+
 			try {
 				size_t start_pos = request.find("GET /download/") + 14;
 				size_t end_pos = request.find(" HTTP/");
@@ -237,7 +265,7 @@ void handle_client(int client_fd) {
         //<====================>
 		//DEFAULT FALLBACK
 		//<====================>
-	   else if(request.find("GET /") != std::string::npos) {
+	   else if(request.find("GET / ") != std::string::npos) {
 	   std::string response = "HTTP/1.1 200 OK\r\n"
 	                          "Content-Length: 22\r\n"
 				  "\r\n"
