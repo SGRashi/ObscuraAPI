@@ -87,17 +87,18 @@ namespace Database {
         }
 
         //upload route
-        bool file_upload(int user_id, const std::string& filename, const std::string& minio_key) {
+        int file_upload(int user_id, const std::string& filename, const std::string& minio_key) {
             try {
                 pqxx::work W(*conn);
-                std::string query = "INSERT INTO files (user_id, filename, minio_key) VALUES ($1, $2, $3);";
-                W.exec(query, pqxx::params{user_id, filename, minio_key});
+                std::string query = "INSERT INTO files (user_id, filename, minio_key) VALUES ($1, $2, $3) RETURNING id;";
+                pqxx::result r = W.exec(query, pqxx::params{user_id, filename, minio_key});
+                int file_id = r[0][0].as<int>();
                 W.commit();
-                return true;
+                return file_id;
             }
             catch(const std::exception& e) {
                 std::cerr << "[Database Error] Failed to upload the file for user " << user_id << ": " << e.what() << "\n";
-                return false;
+                return -1;
             }
         }
 

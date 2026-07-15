@@ -83,7 +83,6 @@ void handle_client(int client_fd) {
 			active_conn--;
 			return;
 		}
-
 		   size_t body_pos = request.find("\r\n\r\n");
 		   if(body_pos != std::string::npos) {
 			   std::string file_content = request.substr(body_pos + 4);
@@ -97,11 +96,11 @@ void handle_client(int client_fd) {
 			   MinioClient storage("http://localhost:9000", cfg.minio_ak, cfg.minio_sk, "obscura-api");
   
 			   if(storage.upload_file(minio_key, data)) {
-				   if(db.file_upload(1, original_filename, minio_key)) {
+				   int file_id = db.file_upload(user_id, original_filename, minio_key);
+				   if(file_id != -1) {
+					    std::string json_r = "{\"status\":\"success\", \"file_id\":" + std::to_string(file_id) + "}";
 					    std::string response = "HTTP/1.1 200 OK\r\n"
-                                               "Content-Length: 14\r\n"
-                                               "\r\n"
-                                               "Upload Success";
+                                               "Content-Length: " + std::to_string(json_r.length()) + "\r\n\r\n" + json_r;
 						send(client_fd, response.c_str(), response.length(), 0);
 				   }
 				   else {
@@ -214,7 +213,6 @@ void handle_client(int client_fd) {
 			active_conn--;
 			return;
 		}
-
 			try {
 				size_t start_pos = request.find("GET /download/") + 14;
 				size_t end_pos = request.find(" HTTP/");
@@ -224,7 +222,7 @@ void handle_client(int client_fd) {
 				std::string filename;
 				std::string minio_key;
 
-				if(db.get_file_metadata(file_id, 1, filename, minio_key)) {
+				if(db.get_file_metadata(file_id, user_id, filename, minio_key)) {
 					std::cout << "[Server] Downloading file: " << filename << " with Key: " + minio_key << "\n";
 
 					MinioClient storage("http://localhost:9000", cfg.minio_ak, cfg.minio_sk, "obscura-api");
