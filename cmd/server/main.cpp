@@ -29,9 +29,9 @@ void handle_client(int client_fd) {
      std::string request(buffer);
 
 
-	 //<=================>
-	 //REGISTER ROUTE
-	 //<=================>
+	    //<==================>
+	    //REGISTER ROUTE
+	    //<==================>
 		if(request.find("POST /register") != std::string::npos) {
 		size_t body_pos = request.find("\r\n\r\n");
 		if(body_pos != std::string::npos) {
@@ -67,9 +67,9 @@ void handle_client(int client_fd) {
 		}
     }
 }
-    //<=================>
-	//UPLOAD ROUTE
-	//<=================>
+        //<==================>
+	    //UPLOAD ROUTE
+	    //<==================>
 	   else if(request.find("POST /upload") != std::string::npos) {
 
 		int user_id = Auth::get_auth(request, cfg.jwt_secret);
@@ -196,7 +196,6 @@ void handle_client(int client_fd) {
 			}
 		}
 	}
-
 	    //<==================>
 		//DOWNLOAD ROUTE
 		//<==================>
@@ -260,10 +259,68 @@ void handle_client(int client_fd) {
 				send(client_fd, err.c_str(), err.length(), 0);
 			}
 		}
-        //<====================>
+        //<==================>
+	    //LISTING ROUTE
+	    //<==================>
+	   else if(request.find("GET /files") != std::string::npos) {
+		int user_id = Auth::get_auth(request, cfg.jwt_secret);
+		if(user_id == -1) {
+			std::string response = "HTTP/1.1 401 Unauthorized\r\n"
+			                       "Content-Length: 26\r\n"
+								   "\r\n"
+								   "Missing or Invalid Session";
+			send(client_fd, response.c_str(), response.length(), 0);
+			close(client_fd);
+			active_conn--;
+			return;
+		}
+		auto files = db.list_files(user_id);
+
+		std::string json_response = "[";
+        for(size_t i = 0; i < files.size(); ++i) {
+        json_response += "{\"id\":" + std::to_string(files[i].first) + 
+                         ", \"name\":\"" + files[i].second + "\"}";
+        if (i < files.size() - 1) json_response += ",";
+        }
+         json_response += "]";
+
+         std::string response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + json_response;
+         send(client_fd, response.c_str(), response.length(), 0);
+	   }
+	    //<==================>
+		//DELETE ROUTE
+		//<==================>
+		else if(request.find("DELETE /delete/") != std::string::npos) {
+			int user_id = Auth::get_auth(request, cfg.jwt_secret);
+            if (user_id == -1) { 
+				std::string response = "HTTP/1.1 401 Unauthorized\r\n"
+			                       "Content-Length: 26\r\n"
+								   "\r\n"
+								   "Missing or Invalid Session";
+			send(client_fd, response.c_str(), response.length(), 0);
+			close(client_fd);
+			active_conn--;
+			return;
+		}
+
+        size_t start = request.find("/delete/") + 8;
+        size_t end = request.find(" ", start);
+        int file_id = std::stoi(request.substr(start, end - start));
+
+        if (db.delete_file(user_id, file_id)) {
+            std::string response = "HTTP/1.1 200 OK\r\n\r\nFile deleted successfully";
+            send(client_fd, response.c_str(), response.length(), 0);
+        } 
+		else {
+            std::string response = "HTTP/1.1 404 Not Found\r\n\r\nFile not found or permission denied";
+            send(client_fd, response.c_str(), response.length(), 0);
+        }
+	}	
+	    //<==================>
 		//DEFAULT FALLBACK
-		//<====================>
+		//<==================>
 	   else if(request.find("GET / ") != std::string::npos) {
+
 	   std::string response = "HTTP/1.1 200 OK\r\n"
 	                          "Content-Length: 22\r\n"
 				  "\r\n"
@@ -272,7 +329,7 @@ void handle_client(int client_fd) {
             // Send response back
             send(client_fd, response.c_str(), response.length(), 0);
 	   }
-
+       
 		else {
 			std::string response = "HTTP/1.1 404 Not Found\r\n"
 				               "\r\n"

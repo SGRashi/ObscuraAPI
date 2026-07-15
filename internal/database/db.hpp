@@ -121,6 +121,36 @@ namespace Database {
                 return false;
             }
         }
+
+        //listing route
+        std::vector<std::pair<int, std::string>> list_files(int user_id) {
+            std ::vector<std::pair<int, std::string>> files;
+            try {
+                pqxx::work W(*conn);
+                pqxx::result r = W.exec("SELECT id, filename FROM files WHERE user_id = $1", pqxx::params(user_id));
+                for (auto const row : r) {
+                    files.push_back({row[0].as<int>(), row[1].as<std::string>()});
+                }
+            }
+            catch (const std::exception& e) {
+                std::cerr << "Database error: " << e.what() << "\n";
+            }
+            return files;
+        }
+
+        //delete route
+        bool delete_file(int user_id, int file_id) {
+            try {
+                pqxx::work W(*conn);
+                pqxx::result r = W.exec("DELETE FROM files WHERE id = $1 AND user_id = $2", pqxx::params(file_id, user_id));
+                W.commit();
+                return r.affected_rows() > 0;
+            }
+            catch (const std::exception& e) {
+                std::cerr << "Database error: " << e.what() << "\n";
+            }
+            return false;
+        }
     };
 }
 
